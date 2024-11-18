@@ -22,13 +22,7 @@ jobs:
             goos: windows
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Setup additional files
-      run: |
-        mkdir -p release_files/data
-        touch release_files/data/accounts.txt
-        touch release_files/data/proxies.txt
-        
+
     - name: Get version from tag
       id: get_version
       run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
