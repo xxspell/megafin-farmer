@@ -53,9 +53,9 @@ jobs:
         release_tag: ${{ github.ref_name }}
         release_name: "Release ${{ github.ref_name }}"
         pre_command: |
-          mkdir -p data || true
-          touch data/accounts.txt || true
-          touch data/proxies.txt || true
+          mkdir -p ./build-artifacts-*/data
+          touch ./build-artifacts-*/data/accounts.txt
+          touch ./build-artifacts-*/data/proxies.txt
         release_body: |
           Release ${{ github.ref_name }}
 
