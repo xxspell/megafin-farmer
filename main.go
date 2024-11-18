@@ -82,6 +82,9 @@ func startTasks(userAction int,
 		utils.AppendFile("./data/accounts.txt", strings.Join(generatedAccountsList, "\n")+"\n")
 
 	} else if userAction == 3 {
+		var totalMgfBalance, totalUsdcBalance float64
+		var mu sync.Mutex
+
 		fmt.Println()
 		for i := 0; i < len(accountsList); i++ {
 			account := accountsList[i]
@@ -92,11 +95,20 @@ func startTasks(userAction int,
 			go func(acc, prox string) {
 				defer wg.Done()
 
-				core.ParseAccountBalance(acc, prox)
+				mgfBalance, usdcBalance := core.ParseAccountBalance(acc, prox)
+
+				mu.Lock()
+				totalMgfBalance += mgfBalance
+				totalUsdcBalance += usdcBalance
+				mu.Unlock()
 			}(account, proxy)
 		}
 
 		wg.Wait()
+
+		fmt.Println()
+		fmt.Printf("Total MGF Balance: %f\n", totalMgfBalance)
+		fmt.Printf("Total USDC Balance: %f\n", totalUsdcBalance)
 
 	}
 }
@@ -159,6 +171,6 @@ func main() {
 	startTasks(userAction, accountsListSorted, proxyListSorted)
 
 	fmt.Printf("The Work Has Beeen Successfully Finished")
-	fmt.Printf("\nPress Enter to Exit..")
+	fmt.Printf("\n\nPress Enter to Exit..")
 	inputUser()
 }
