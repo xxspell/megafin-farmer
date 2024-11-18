@@ -1,0 +1,120 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23.3'
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 ${{ env.VERSION }}^ || git rev-list --max-parents=0 HEAD)
+          CHANGELOG=$(git log ${PREVIOUS_TAG}..${{ env.VERSION }} --pretty=format:"* %s%n")
+          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
+          echo "$CHANGELOG" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Prepare build directories
+        run: |
+          # Create directories for each platform
+          mkdir -p build/linux-amd64
+          mkdir -p build/windows-amd64
+          mkdir -p build/darwin-amd64
+          mkdir -p build/darwin-arm64
+          
+          # Create empty accounts.txt and proxies.txt for each platform
+          for dir in build/*; do
+            touch "$dir/accounts.txt"
+            touch "$dir/proxies.txt"
+          done
+
+      - name: Build for multiple platforms
+        run: |
+          # Linux AMD64
+          GOOS=linux GOARCH=amd64 go build -o build/linux-amd64/megafin-farmer ./cmd/megafin-farmer
+          
+          # Windows AMD64
+          GOOS=windows GOARCH=amd64 go build -o build/windows-amd64/megafin-farmer.exe ./cmd/megafin-farmer
+          
+          # macOS AMD64
+          GOOS=darwin GOARCH=amd64 go build -o build/darwin-amd64/megafin-farmer ./cmd/megafin-farmer
+          
+          # macOS ARM64 (M1/M2)
+          GOOS=darwin GOARCH=arm64 go build -o build/darwin-arm64/megafin-farmer ./cmd/megafin-farmer
+
+      - name: Create ZIP archives
+        run: |
+          cd build
+          zip -r megafin-farmer-linux-amd64.zip linux-amd64/
+          zip -r megafin-farmer-windows-amd64.zip windows-amd64/
+          zip -r megafin-farmer-darwin-amd64.zip darwin-amd64/
+          zip -r megafin-farmer-darwin-arm64.zip darwin-arm64/
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Release ${{ env.VERSION }}
+          body: |
+            Release ${{ env.VERSION }}
+            
+            Changes in this release:
+            ${{ env.CHANGELOG }}
+            
+            Available builds:
+            
+            1. Linux AMD64 (for most Linux distributions):
+               - File: megafin-farmer-linux-amd64.zip
+               - OS: Linux
+               - Architecture: 64-bit (x86_64)
+            
+            2. Windows AMD64 (for Windows 7/8/10/11):
+               - File: megafin-farmer-windows-amd64.zip
+               - OS: Windows
+               - Architecture: 64-bit (x86_64)
+            
+            3. macOS AMD64 (for Intel Macs):
+               - File: megafin-farmer-darwin-amd64.zip
+               - OS: macOS
+               - Architecture: 64-bit Intel
+            
+            4. macOS ARM64 (for M1/M2 Macs):
+               - File: megafin-farmer-darwin-arm64.zip
+               - OS: macOS
+               - Architecture: 64-bit ARM (Apple Silicon)
+            
+            Thank you separately - https://github.com/nazavod777/megafin_farmer_v2
+          files: |
+            build/megafin-farmer-linux-amd64.zip
+            build/megafin-farmer-windows-amd64.zip
+            build/megafin-farmer-darwin-amd64.zip
+            build/megafin-farmer-darwin-arm64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: binaries
+          path: build/*.zip

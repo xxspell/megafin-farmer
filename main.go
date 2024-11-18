@@ -5,9 +5,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"log"
+	"megafin_farmer/config"
 	"megafin_farmer/core"
+	"megafin_farmer/metrics"
 	"megafin_farmer/utils"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -36,7 +40,9 @@ func handlePanic() {
 func startTasks(userAction int,
 	accountsList []string,
 	proxyList []string) {
+
 	var wg sync.WaitGroup
+	metrics.ActiveAccounts.Set(float64(len(accountsList)))
 
 	if userAction == 1 {
 		fmt.Println()
@@ -114,6 +120,11 @@ func startTasks(userAction int,
 }
 
 func main() {
+	config.InitConfig("config.json")
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		http.ListenAndServe(":"+config.GlobalConfig.Port, nil)
+	}()
 	var proxyListSorted []string
 	var accountsListSorted []string
 	defer handlePanic()

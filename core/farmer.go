@@ -7,7 +7,10 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/valyala/fasthttp"
 	"log"
+	"megafin_farmer/config"
 	"megafin_farmer/customTypes"
+	"megafin_farmer/metrics"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,6 +21,11 @@ func doRequest(client *fasthttp.Client,
 	payload interface{},
 	headers map[string]string) ([]byte, error) {
 
+	metrics.IsServerDown()
+
+	metrics.TotalRequests.WithLabelValues(method, "attempt").Inc()
+	start := time.Now()
+
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 
@@ -25,28 +33,62 @@ func doRequest(client *fasthttp.Client,
 	req.SetRequestURI(url)
 	req.Header.SetContentType("application/json")
 
+	var requestSize int64 = 0
+
 	if payload != nil {
 		jsonData, err := json.Marshal(payload)
-
 		if err != nil {
+			metrics.ErrorCounter.WithLabelValues("json_marshal").Inc()
 			return nil, fmt.Errorf("failed to marshal JSON: %w", err)
 		}
 		req.SetBody(jsonData)
+		requestSize = int64(len(jsonData))
 	}
 
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
 
+	req.Header.VisitAll(func(key, value []byte) {
+		requestSize += int64(len(key) + len(value))
+	})
+
+	// Записываем исходящий трафик
+	metrics.TotalTrafficBytes.WithLabelValues("out").Add(float64(requestSize))
+
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseResponse(resp)
 
 	if err := client.Do(req, resp); err != nil {
+		metrics.TotalErrors.WithLabelValues("request_failed").Inc()
 		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	statusCode := resp.StatusCode()
+	metrics.TotalRequests.WithLabelValues(method, strconv.Itoa(statusCode)).Inc()
+	if statusCode == 520 {
+		metrics.SetServerDown()
+		return nil, fmt.Errorf("server is down (520 error)")
+	}
+	metrics.SetServerUp()
+
+	metrics.RequestDuration.WithLabelValues(method).Observe(time.Since(start).Seconds())
+	metrics.ResponseStatus.WithLabelValues(method, strconv.Itoa(statusCode)).Inc()
+
+	if statusCode >= 400 {
+		metrics.TotalErrors.WithLabelValues("http_" + strconv.Itoa(statusCode)).Inc()
 	}
 
 	respBody := make([]byte, len(resp.Body()))
 	copy(respBody, resp.Body())
+
+	// Учитываем входящий трафик (тело ответа + заголовки)
+	responseSize := int64(len(respBody))
+	resp.Header.VisitAll(func(key, value []byte) {
+		responseSize += int64(len(key) + len(value))
+	})
+	metrics.TotalTrafficBytes.WithLabelValues("in").Add(float64(responseSize))
+
 	return respBody, nil
 }
 
@@ -63,7 +105,7 @@ func profileRequest(client *fasthttp.Client,
 			continue
 		}
 
-		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") {
+		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") || strings.Contains(string(respBody), "<title>Just a moment...</title>") {
 			log.Printf("%s | CloudFlare", privateKeyHex)
 			continue
 		}
@@ -99,7 +141,7 @@ func loginAccount(client *fasthttp.Client,
 	signHash := fmt.Sprintf("0x%x", signature)
 
 	payload := map[string]interface{}{
-		"invite_code": "133d76e4",
+		"invite_code": config.GlobalConfig.RefCode,
 		"key":         address.String(),
 		"wallet_hash": signHash,
 	}
@@ -113,7 +155,7 @@ func loginAccount(client *fasthttp.Client,
 			continue
 		}
 
-		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") {
+		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") || strings.Contains(string(respBody), "<title>Just a moment...</title>") {
 			log.Printf("%s | CloudFlare", privateKeyHex)
 			continue
 		}
@@ -140,7 +182,7 @@ func sendConnectRequest(client *fasthttp.Client,
 			continue
 		}
 
-		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") {
+		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") || strings.Contains(string(respBody), "<title>Just a moment...</title>") {
 			log.Printf("%s | CloudFlare", privateKeyHex)
 			continue
 		}
@@ -163,7 +205,8 @@ func StartFarmAccount(privateKey string,
 		"referer":         "https://app.megafin.xyz",
 		"connection":      "close",
 	}
-
+	metrics.IncrementActiveAccounts()
+	defer metrics.DecrementActiveAccounts()
 	client := GetClient(proxy)
 	authToken := loginAccount(client, privateKey, headers)
 	headers["Authorization"] = "Bearer " + authToken
@@ -171,7 +214,21 @@ func StartFarmAccount(privateKey string,
 
 	for {
 		mgfBalance, usdcBalance := sendConnectRequest(client, privateKey, headers)
-		log.Printf("%s | MGF Balance: %f | USDC Balance: %f | Sleeping 90 secs.", privateKey, mgfBalance, usdcBalance)
+
+		// Атомарно обновляем общие балансы
+		metrics.UpdateAccountBalance(privateKey, mgfBalance, usdcBalance)
+
+		log.Printf("%s | MGF Balance: %f | USDC Balance: %f | Sleeping 90 secs.",
+			privateKey, mgfBalance, usdcBalance)
+
+		isServerDown := metrics.IsServerDown()
+
+		if isServerDown {
+			log.Printf("%s | Server is down, waiting for 5 minutes", privateKey)
+			time.Sleep(5 * time.Minute)
+			continue
+		}
+
 		time.Sleep(time.Second * time.Duration(90))
 	}
 }
@@ -191,6 +248,8 @@ func ParseAccountBalance(privateKey string,
 	headers["Authorization"] = "Bearer " + authToken
 	profileRequest(client, privateKey, headers)
 	mgfBalance, usdcBalance := sendConnectRequest(client, privateKey, headers)
+
+	metrics.UpdateAccountBalance(privateKey, mgfBalance, usdcBalance)
 
 	log.Printf("%s | MGF Balance: %f | USDC Balance: %f", privateKey, mgfBalance, usdcBalance)
 
