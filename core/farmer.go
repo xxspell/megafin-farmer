@@ -54,6 +54,8 @@ func profileRequest(client *fasthttp.Client,
 	privateKeyHex string,
 	headers map[string]string) {
 	for {
+		var responseData customTypes.ProfileResponseStruct
+
 		respBody, err := doRequest(client, "https://api.megafin.xyz/users/profile", "GET", nil, headers)
 
 		if err != nil {
@@ -63,6 +65,11 @@ func profileRequest(client *fasthttp.Client,
 
 		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") {
 			log.Printf("%s | CloudFlare", privateKeyHex)
+			continue
+		}
+
+		if err = json.Unmarshal(respBody, &responseData); err != nil {
+			log.Printf("%s | Failed To Parse JSON Response When Profile: %s", privateKeyHex, string(respBody))
 			continue
 		}
 
