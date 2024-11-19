@@ -125,14 +125,23 @@ func main() {
 		http.Handle("/metrics", promhttp.Handler())
 		http.ListenAndServe(":"+config.GlobalConfig.Port, nil)
 	}()
+
 	var proxyListSorted []string
 	var accountsListSorted []string
+
+	config.InitHeadersManager(config.GlobalConfig.ApiKeyScrapeops)
+
 	defer handlePanic()
 
 	accountsList, err := utils.ReadFileByRows("./data/accounts.txt")
 
 	if err != nil {
 		log.Panicf("Error While Reading Accounts File: %v", err)
+	}
+
+	err1 := config.GlobalHeadersManager.PrepareHeadersForAccounts(len(accountsList))
+	if err1 != nil {
+		log.Fatalf("Failed to prepare headers: %v", err)
 	}
 
 	proxyList, err := utils.ReadFileByRows("./data/proxies.txt")

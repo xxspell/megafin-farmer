@@ -19,7 +19,7 @@ func doRequest(client *fasthttp.Client,
 	url string,
 	method string,
 	payload interface{},
-	headers map[string]string) ([]byte, error) {
+	headers map[string]string) ([]byte, int, error) {
 
 	metrics.IsServerDown()
 
@@ -37,9 +37,10 @@ func doRequest(client *fasthttp.Client,
 
 	if payload != nil {
 		jsonData, err := json.Marshal(payload)
+
 		if err != nil {
 			metrics.ErrorCounter.WithLabelValues("json_marshal").Inc()
-			return nil, fmt.Errorf("failed to marshal JSON: %w", err)
+			return nil, 0, fmt.Errorf("failed to marshal JSON: %w", err)
 		}
 		req.SetBody(jsonData)
 		requestSize = int64(len(jsonData))
@@ -52,8 +53,6 @@ func doRequest(client *fasthttp.Client,
 	req.Header.VisitAll(func(key, value []byte) {
 		requestSize += int64(len(key) + len(value))
 	})
-
-	// Записываем исходящий трафик
 	metrics.TotalTrafficBytes.WithLabelValues("out").Add(float64(requestSize))
 
 	resp := fasthttp.AcquireResponse()
@@ -61,20 +60,19 @@ func doRequest(client *fasthttp.Client,
 
 	if err := client.Do(req, resp); err != nil {
 		metrics.TotalErrors.WithLabelValues("request_failed").Inc()
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
 
 	statusCode := resp.StatusCode()
 	metrics.TotalRequests.WithLabelValues(method, strconv.Itoa(statusCode)).Inc()
 	if statusCode == 520 {
 		metrics.SetServerDown()
-		return nil, fmt.Errorf("server is down (520 error)")
+		return nil, statusCode, fmt.Errorf("server is down (520 error)")
 	}
 	metrics.SetServerUp()
 
 	metrics.RequestDuration.WithLabelValues(method).Observe(time.Since(start).Seconds())
 	metrics.ResponseStatus.WithLabelValues(method, strconv.Itoa(statusCode)).Inc()
-
 	if statusCode >= 400 {
 		metrics.TotalErrors.WithLabelValues("http_" + strconv.Itoa(statusCode)).Inc()
 	}
@@ -82,46 +80,51 @@ func doRequest(client *fasthttp.Client,
 	respBody := make([]byte, len(resp.Body()))
 	copy(respBody, resp.Body())
 
-	// Учитываем входящий трафик (тело ответа + заголовки)
 	responseSize := int64(len(respBody))
 	resp.Header.VisitAll(func(key, value []byte) {
 		responseSize += int64(len(key) + len(value))
 	})
 	metrics.TotalTrafficBytes.WithLabelValues("in").Add(float64(responseSize))
 
-	return respBody, nil
+	return respBody, resp.StatusCode(), nil
 }
 
 func profileRequest(client *fasthttp.Client,
 	privateKeyHex string,
-	headers map[string]string) {
+	headers map[string]string) (map[string]string, float64, float64) {
 	for {
 		var responseData customTypes.ProfileResponseStruct
 
-		respBody, err := doRequest(client, "https://api.megafin.xyz/users/profile", "GET", nil, headers)
+		respBody, statusCode, err := doRequest(client, "https://api.megafin.xyz/users/profile", "GET", nil, headers)
 
 		if err != nil {
-			log.Printf("%s | Error When Profile: %s", privateKeyHex, err)
+			log.Printf("%s | Error When Profile: %s | Status Code: %d", privateKeyHex, err, statusCode)
+			headers = config.GlobalHeadersManager.ReplaceHeadersForAccount(privateKeyHex, headers)
 			continue
 		}
 
-		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") || strings.Contains(string(respBody), "<title>Just a moment...</title>") {
+		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") || strings.Contains(string(respBody), "<title>Just a moment...</title>") || strings.Contains(string(respBody), "<title>Attention Required! | Cloudflare</title>\n") {
 			log.Printf("%s | CloudFlare", privateKeyHex)
+			headers = config.GlobalHeadersManager.ReplaceHeadersForAccount(privateKeyHex, headers)
 			continue
 		}
 
 		if err = json.Unmarshal(respBody, &responseData); err != nil {
-			log.Printf("%s | Failed To Parse JSON Response When Profile: %s", privateKeyHex, string(respBody))
+			log.Printf("%s | Failed To Parse JSON Response When Profile: %s | Status Code: %d", privateKeyHex, string(respBody), statusCode)
+			headers = config.GlobalHeadersManager.ReplaceHeadersForAccount(privateKeyHex, headers)
 			continue
 		}
 
-		return
+		return headers, responseData.Result.Balance.MGF, responseData.Result.Balance.USDC
 	}
 }
 
 func loginAccount(client *fasthttp.Client,
 	privateKeyHex string,
-	headers map[string]string) string {
+	headers map[string]string) (map[string]string, string) {
+
+	headers["accept"] = "application/json"
+
 	privateKey, err := crypto.HexToECDSA(privateKeyHex)
 
 	if err != nil {
@@ -148,74 +151,74 @@ func loginAccount(client *fasthttp.Client,
 
 	for {
 		var responseData customTypes.LoginResponseStruct
-		respBody, err := doRequest(client, "https://api.megafin.xyz/auth", "POST", payload, headers)
+		respBody, statusCode, err := doRequest(client, "https://api.megafin.xyz/auth", "POST", payload, headers)
 
 		if err != nil {
-			log.Printf("%s | Error When Auth: %s", privateKeyHex, err)
+			log.Printf("%s | Error When Auth: %s | Status Code: %d", privateKeyHex, err, statusCode)
+			headers = config.GlobalHeadersManager.ReplaceHeadersForAccount(privateKeyHex, headers)
 			continue
 		}
 
 		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") || strings.Contains(string(respBody), "<title>Just a moment...</title>") {
 			log.Printf("%s | CloudFlare", privateKeyHex)
+			headers = config.GlobalHeadersManager.ReplaceHeadersForAccount(privateKeyHex, headers)
 			continue
 		}
 
 		if err = json.Unmarshal(respBody, &responseData); err != nil {
-			log.Printf("%s | Failed To Parse JSON Response When Logging: %s", privateKeyHex, string(respBody))
+			log.Printf("%s | Failed To Parse JSON Response When Logging: %s | Status Code: %d", privateKeyHex, string(respBody), statusCode)
+			headers = config.GlobalHeadersManager.ReplaceHeadersForAccount(privateKeyHex, headers)
 			continue
 		}
 
-		return responseData.Result.Token
+		return headers, responseData.Result.Token
 	}
 }
 
 func sendConnectRequest(client *fasthttp.Client,
 	privateKeyHex string,
-	headers map[string]string) (float64, float64) {
+	headers map[string]string) (map[string]string, float64, float64) {
 	for {
 		var responseData customTypes.PingResponseStruct
 
-		respBody, err := doRequest(client, "https://api.megafin.xyz/users/connect", "GET", nil, headers)
+		respBody, statusCode, err := doRequest(client, "https://api.megafin.xyz/users/connect", "GET", nil, headers)
 
 		if err != nil {
-			log.Printf("%s | Error When Pinging: %s", privateKeyHex, err)
+			log.Printf("%s | Error When Pinging: %s | Status Code: %d", privateKeyHex, err, statusCode)
+			headers = config.GlobalHeadersManager.ReplaceHeadersForAccount(privateKeyHex, headers)
 			continue
 		}
 
-		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") || strings.Contains(string(respBody), "<title>Just a moment...</title>") {
+		if strings.Contains(string(respBody), "title>Access denied | api.megafin.xyz used Cloudflare to restrict access</title>") || strings.Contains(string(respBody), "<title>Just a moment...</title>") || strings.Contains(string(respBody), "<title>Attention Required! | Cloudflare</title>\n") {
 			log.Printf("%s | CloudFlare", privateKeyHex)
+			headers = config.GlobalHeadersManager.ReplaceHeadersForAccount(privateKeyHex, headers)
 			continue
 		}
 
 		if err = json.Unmarshal(respBody, &responseData); err != nil {
-			log.Printf("%s | Failed To Parse JSON Response When Pinging: %s", privateKeyHex, string(respBody))
+			log.Printf("%s | Failed To Parse JSON Response When Pinging: %s | Status Code: %d", privateKeyHex, string(respBody), statusCode)
+			headers = config.GlobalHeadersManager.ReplaceHeadersForAccount(privateKeyHex, headers)
 			continue
 		}
 
-		return responseData.Result.Balance.MGF, responseData.Result.Balance.USDC
+		return headers, responseData.Result.Balance.MGF, responseData.Result.Balance.USDC
 	}
 }
 
 func StartFarmAccount(privateKey string,
 	proxy string) {
-	headers := map[string]string{
-		"accept":          "*/*",
-		"accept-language": "ru,en;q=0.9,vi;q=0.8,es;q=0.7,cy;q=0.6",
-		"origin":          "https://app.megafin.xyz",
-		"referer":         "https://app.megafin.xyz",
-		"connection":      "close",
-	}
+	headers := config.GlobalHeadersManager.GetHeadersForAccount(privateKey)
 	metrics.IncrementActiveAccounts()
 	defer metrics.DecrementActiveAccounts()
 	client := GetClient(proxy)
-	authToken := loginAccount(client, privateKey, headers)
+	headers, authToken := loginAccount(client, privateKey, headers)
 	headers["Authorization"] = "Bearer " + authToken
 	profileRequest(client, privateKey, headers)
 
 	for {
-		mgfBalance, usdcBalance := sendConnectRequest(client, privateKey, headers)
+		var mgfBalance, usdcBalance float64
+		headers, mgfBalance, usdcBalance = sendConnectRequest(client, privateKey, headers)
 
-		// Атомарно обновляем общие балансы
 		metrics.UpdateAccountBalance(privateKey, mgfBalance, usdcBalance)
 
 		log.Printf("%s | MGF Balance: %f | USDC Balance: %f | Sleeping 90 secs.",
@@ -235,19 +238,12 @@ func StartFarmAccount(privateKey string,
 
 func ParseAccountBalance(privateKey string,
 	proxy string) (float64, float64) {
-	headers := map[string]string{
-		"accept":          "*/*",
-		"accept-language": "ru,en;q=0.9,vi;q=0.8,es;q=0.7,cy;q=0.6",
-		"origin":          "https://app.megafin.xyz",
-		"referer":         "https://app.megafin.xyz",
-		"connection":      "close",
-	}
+	headers := config.GlobalHeadersManager.GetHeadersForAccount(privateKey)
 
 	client := GetClient(proxy)
-	authToken := loginAccount(client, privateKey, headers)
+	headers, authToken := loginAccount(client, privateKey, headers)
 	headers["Authorization"] = "Bearer " + authToken
-	profileRequest(client, privateKey, headers)
-	mgfBalance, usdcBalance := sendConnectRequest(client, privateKey, headers)
+	headers, mgfBalance, usdcBalance := profileRequest(client, privateKey, headers)
 
 	metrics.UpdateAccountBalance(privateKey, mgfBalance, usdcBalance)
 
